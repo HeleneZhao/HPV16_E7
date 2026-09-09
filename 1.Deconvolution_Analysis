@@ -1,0 +1,166 @@
+# ==============================================================================
+# Immune Cell Deconvolution Analysis
+# on bulk RNA-seq data
+# ==============================================================================
+
+# --- Setup ---
+rm(list = ls())
+
+# Libraries
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(data.table)
+  library(readxl)
+  library(org.Mm.eg.db)
+  library(AnnotationDbi)
+  library(pheatmap)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(mMCPcounter)
+  library(ComICS)
+  library(sva)  # for ComBat
+})
+
+# Output directory
+outdir <- "./"
+
+
+# ==============================================================================
+# 1. DATA LOADING AND PREPROCESSING
+# ==============================================================================
+
+# --- Read sample metadata ---
+smp <- as.data.frame(read_xlsx("./sample2.xlsx"))
+
+# desired global order (contains all options)
+desired_levels <- c("PBS", "WT-E7", "a-41BB", "ROP-E7", "ROP-E7+a-41BB")
+group_order <- desired_levels[desired_levels %in% smp$group]
+
+smp$group <- factor(smp$group, levels = group_order)
+
+# also sort the metadata rows by group, then by sample to lock display order
+smp <- smp[order(smp$group, smp$sample), , drop = FALSE]
+smp$group <- factor(smp$group, levels = group_order)
+
+message("Sample information:")
+print(table(smp$group))
+
+# --- Read FPKM data (two batches) ---
+cts1 <- fread("./all.fpkm_anno1.xls") %>%
+  as.data.frame() %>%
+  dplyr::select(1, 2, 4, 6, 8, 10, 12) %>%
+  setNames(c("gene_id", "Exonic.gene.sizes", "PBS_1", "ROP-E7_1", 
+             "a-41BB_1", "ROP-E7+a-41BB_1", "WT-E7_1"))
+
+cts2 <- fread("./all.fpkm_anno2.xls") %>%
+  as.data.frame() %>%
+  dplyr::select(1, 2, 4, 6, 8, 10, 12) %>%
+  setNames(c("gene_id", "Exonic.gene.sizes", "PBS_2", "ROP-E7_2", 
+             "a-41BB_2", "ROP-E7+a-41BB_2", "WT-E7_2"))
+
+# Merge batches
+cts <- inner_join(cts1, cts2, by = c("gene_id", "Exonic.gene.sizes"))
+
+# Remove Ensembl version suffixes
+cts$gene_id <- sub("\\..*$", "", cts$gene_id)
+
+# --- Calculate TPM from FPKM ---
+# --- Lock samples and columns ---
+all_expr_cols <- setdiff(names(cts), c("gene_id","Exonic.gene.sizes"))
+samples <- smp$sample[smp$sample %in% all_expr_cols]
+smp <- smp[match(samples, smp$sample), , drop = FALSE]
+cts <- cts[, c("gene_id","Exonic.gene.sizes", samples)]
+
+# --- TPM from FPKM ---
+fpkm <- as.data.frame(cts[, samples, drop = FALSE])
+tpm  <- sweep(fpkm, 2, colSums(fpkm, na.rm = TRUE) / 1e6, "/")
+tpm  <- as.data.frame(tpm); rownames(tpm) <- cts$gene_id
+
+message(sprintf("Starting with %d genes", nrow(tpm)))
+
+# --- Map EnsemblIDs to Gene Symbols ---
+ens2sym <- mapIds(org.Mm.eg.db, keys = rownames(tpm), keytype = "ENSEMBL",
+                  column = "SYMBOL", multiVals = "first")
+keep <- !is.na(ens2sym)
+tpm <- tpm[keep, ]; ens2sym <- ens2sym[keep]
+
+tpm$Symbol  <- unname(ens2sym)
+tpm$meanTPM <- rowMeans(tpm[, samples, drop = FALSE], na.rm = TRUE)
+
+tpm_sym <- tpm %>%
+  arrange(desc(meanTPM)) %>%
+  distinct(Symbol, .keep_all = TRUE) %>%
+  dplyr::select(all_of(samples), Symbol)
+
+tpm_sym <- as.data.frame(tpm_sym)
+rownames(tpm_sym) <- tpm_sym$Symbol
+tpm_sym$Symbol <- NULL
+
+logtpm <- log2(tpm_sym + 1)
+# ==============================================================================
+# 2. BATCH CORRECTION (ComBat)
+# ==============================================================================
+
+message("\nPerforming batch correction...")
+
+# Prepare model matrix (preserve group information)
+exp_cli <- cbind(smp, t(logtpm))
+
+exp_cli$group_mod <- exp_cli$group %>%
+  as.character() %>%
+  str_replace("PBS", "1") %>%
+  str_replace("a-41BB", "2") %>%
+  str_replace("ROP-E7", "3") %>%
+  str_replace("ROP-E7+a-41BB", "4")
+
+
+mod_combat <- model.matrix(~1 + group_mod, data = exp_cli)
+
+# Apply ComBat
+logtpm_combat <- ComBat(dat = logtpm, 
+                        batch = exp_cli$batch, 
+                        mod = mod_combat)
+
+message("Batch correction complete")
+
+gene_expression_matrix=2^logtpm_combat
+
+res_mMCPcounter <- immunedeconv::deconvolute_mouse(gene_expression_matrix, "mmcp_counter")
+res_dcq <- immunedeconv::deconvolute_mouse(gene_expression_matrix, "dcq")
+
+# ==============================================================================
+# 3. STATISTICAL TESTING
+# ==============================================================================
+
+message("\nPerforming statistical tests...")
+
+# ANOVA for group differences
+do_anova <- function(mat, sample_info) {
+  # mat should be: cell types (rows) × samples (columns)
+  res <- lapply(rownames(mat), function(ct) {
+    df <- data.frame(
+      val = as.numeric(mat[ct, sample_info$sample]),
+      group = sample_info$group
+    )
+    a <- anova(lm(val ~ group, df))
+    tibble(cell_type = ct, p = a$`Pr(>F)`[1])
+  }) %>% bind_rows()
+  
+  res$FDR <- p.adjust(res$p, method = "BH")
+  res %>% arrange(FDR)
+}
+
+# mMCP-counter: cell types × samples (already correct)
+stats_mmcp <- do_anova(res_mMCPcounter, smp)
+
+# DCQ: need to transpose (samples × cell types → cell types × samples)
+stats_dcq <- do_anova(res_dcq, smp)
+
+message("\nTop significant cell types (mMCP-counter):")
+print(head(stats_mmcp, 10))
+
+message("\nTop significant cell types (DCQ):")
+print(head(stats_dcq, 10))
+
+################################################################################
