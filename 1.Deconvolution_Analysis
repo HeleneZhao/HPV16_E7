@@ -155,7 +155,7 @@ do_anova <- function(mat, sample_info) {
 stats_mmcp <- do_anova(res_mMCPcounter, smp)
 
 # DCQ: need to transpose (samples × cell types → cell types × samples)
-stats_dcq <- do_anova(res_dcq, smp)
+stats_dcq <- do_anova(t(res_dcq), smp)
 
 message("\nTop significant cell types (mMCP-counter):")
 print(head(stats_mmcp, 10))
